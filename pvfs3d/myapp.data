@@ -1,0 +1,150 @@
+#version 300 es
+precision mediump float;
+uniform mat4 u_viewProjection;
+uniform mat4 u_viewProjectionInv;
+uniform vec2 u_halfScreenSize;
+uniform vec3 u_eyePos;
+
+uniform vec2 u_depthConsts;
+
+flat in uint out_material_id;
+flat in vec3 out_sphereCenter;
+
+out vec4 outColor;
+
+const vec4 colors[4] = vec4[4](vec4(0.902f, 41.0f / 255.0f, 55.0f / 255.0f, 1.0f), // Red
+vec4(1.0f, 161.0f / 255.0f, 0.0f, 1.0f), // Orange
+vec4(0.0f, 228.0f / 255.0f, 48.0f / 255.0f, 1.0f),  // Green
+vec4(0.0f, 121.0f / 255.0f, 241.0f / 255.0f, 1.0f)  // Blue
+);
+
+    // Inigo Quilez's sphere intersection function5
+float sphIntersect(vec3 ro, vec3 rd, vec4 sph) {
+  vec3 oc = ro - sph.xyz;
+  float b = dot(oc, rd);
+  float c = dot(oc, oc) - sph.w * sph.w;
+  float h = b * b - c;
+  if(h < 0.0f)
+    return -1.0f;
+  h = sqrt(h);
+  return -b - h;
+}
+
+float sph4Intersect(in vec3 ro, in vec3 rd, in float ra) {
+  float r2 = ra * ra;
+  vec3 d2 = rd * rd;
+  vec3 d3 = d2 * rd;
+  vec3 o2 = ro * ro;
+  vec3 o3 = o2 * ro;
+  float ka = 1.0f / dot(d2, d2);
+  float k3 = ka * dot(ro, d3);
+  float k2 = ka * dot(o2, d2);
+  float k1 = ka * dot(o3, rd);
+  float k0 = ka * (dot(o2, o2) - r2 * r2);
+  float c2 = k2 - k3 * k3;
+  float c1 = k1 + 2.0f * k3 * k3 * k3 - 3.0f * k3 * k2;
+  float c0 = k0 - 3.0f * k3 * k3 * k3 * k3 + 6.0f * k3 * k3 * k2 - 4.0f * k3 * k1;
+  float p = c2 * c2 + c0 / 3.0f;
+  float q = c2 * c2 * c2 - c2 * c0 + c1 * c1;
+  float h = q * q - p * p * p;
+  if(h < 0.0f)
+    return -1.0f; //no intersection
+  float sh = sqrt(h);
+  float s = sign(q + sh) * pow(abs(q + sh), 1.0f / 3.0f); // cuberoot
+  float t = sign(q - sh) * pow(abs(q - sh), 1.0f / 3.0f); // cuberoot
+  vec2 w = vec2(s + t, s - t);
+  vec2 v = vec2(w.x + c2 * 4.0f, w.y * sqrt(3.0f)) * 0.5f;
+  float r = length(v);
+  return -abs(v.y) / sqrt(r + v.x) - c1 / r - k3;
+}
+
+void main() {
+  vec2 ndc = gl_FragCoord.xy / u_halfScreenSize - 1.0f;
+  // ndc.y = -ndc.y;
+
+  vec4 csPosition = vec4(ndc, 0.0f, 1.0f);
+  vec4 wsPosition = u_viewProjectionInv * csPosition;
+  wsPosition /= wsPosition.w;
+
+  vec3 rayDir = normalize(wsPosition.xyz - u_eyePos);
+
+  // float t = sph4Intersect( u_eyePos - out_sphereCenter, rayDir,  0.25 );
+  float t = sphIntersect(u_eyePos - out_sphereCenter, rayDir, vec4(0.0f, 0.0f, 0.0f, 0.25f));
+
+  if(t < 0.0f)
+    discard;
+
+  vec3 worldPos = u_eyePos + t * rayDir;
+
+  vec3 dPos = worldPos - out_sphereCenter;
+  vec3 normal = normalize(worldPos - out_sphereCenter);
+
+  // normal = normalize(dPos * dPos * dPos);
+
+  // do phong shading
+  vec3 lightDir = normalize(vec3(1.0f, 1.0f, 1.0f));
+  float diff = max(dot(normal, lightDir), 0.0f) * 0.8f + 0.2f;
+  vec3 diffuse = diff * colors[out_material_id].xyz;
+
+  vec4 csWorldPos = u_viewProjection * vec4(worldPos, 1.0f);
+  float depth = csWorldPos.z / csWorldPos.w;
+
+  float dist = length(out_sphereCenter - u_eyePos);
+  float fogFactor = exp(-dist * 0.02f);
+  fogFactor = clamp(fogFactor, 0.0f, 1.0f);
+
+  outColor = mix(vec4(0.0f, 0.0f, 0.0f, 1.0f), vec4(diffuse, 1.0f), fogFactor);
+  // float depth = u_depthConsts.x / (t - u_depthConsts.y);
+
+  gl_FragDepth = depth;
+
+}
+#version 300 es
+precision mediump float;
+in vec3 position;
+in uint material_id;
+uniform mat4 u_viewProjection;
+uniform vec2 u_halfScreenSize;
+
+flat out uint out_material_id;
+flat out vec3 out_sphereCenter;
+
+// Implementation of the fast quadric projection by Majercik et al.
+// Alexander Majercik, Cyril Crassin, Peter Shirley, and Morgan McGuire, A Ray-Box Intersection Algorithm and Efficient Dynamic Voxel Rendering, Journal of Computer Graphics Techniques (JCGT), vol. 7, no. 3, 66-81, 2018
+// Available online http://jcgt.org/published/0007/03/04/
+// Fast Quadric Proj: "GPU-Based Ray-Casting of Quadratic Surfaces" http://dl.acm.org/citation.cfm?id=2386396
+void quadricProj(in vec3 osPosition, in float sphereRadius, in mat4 objectToScreenMatrix, in vec2 halfScreenSize, inout vec4 csPosition, inout float pointSize) {
+  const vec4 quadricMat = vec4(1.0f, 1.0f, 1.0f, -1.0f);
+  vec4 sphereCenter = vec4(osPosition.xyz, 1.0f);
+  mat4 modelViewProj = transpose(objectToScreenMatrix);
+  // mat4 modelViewProj = objectToScreenMatrix;
+
+  mat3x4 matT = mat3x4(mat3(modelViewProj[0].xyz, modelViewProj[1].xyz, modelViewProj[3].xyz) * sphereRadius);
+  matT[0].w = dot(sphereCenter, modelViewProj[0]);
+  matT[1].w = dot(sphereCenter, modelViewProj[1]);
+  matT[2].w = dot(sphereCenter, modelViewProj[3]);
+
+  mat3x4 matD = mat3x4(matT[0] * quadricMat, matT[1] * quadricMat, matT[2] * quadricMat);
+  vec4 eqCoefs = vec4(dot(matD[0], matT[2]), dot(matD[1], matT[2]), dot(matD[0], matT[0]), dot(matD[1], matT[1])) / dot(matD[2], matT[2]);
+
+  vec4 outPosition = vec4(eqCoefs.x, eqCoefs.y, 0.0f, 1.0f);
+  vec2 AABB = sqrt(eqCoefs.xy * eqCoefs.xy - eqCoefs.zw);
+  AABB *= halfScreenSize * 2.0f;
+
+  csPosition.xy = outPosition.xy * csPosition.w;
+  pointSize = max(AABB.x, AABB.y);
+}
+
+void main() {
+  // Prepare parameters for fast quadric projection
+  vec4 csPosition = u_viewProjection * vec4(position, 1.0f);
+  float pointSize;
+  float sphereRadius = 0.25f;
+  quadricProj(position, sphereRadius, u_viewProjection, u_halfScreenSize, csPosition, pointSize);
+
+  gl_Position = csPosition;
+  gl_PointSize = pointSize;
+
+  out_material_id = material_id;
+  out_sphereCenter = position;
+}
