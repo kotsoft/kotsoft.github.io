@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="en-us">
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Grantophone Classic</title>
+  <style>
+    html,
+    body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      -webkit-user-select: none;
+      user-select: none;
+      touch-action: none;
+      background-color: black;
+    }
+
+    canvas {
+      width: 100%;
+      height: 100%;
+      background-color: #333;
+
+      -webkit-user-select: none;
+      user-select: none;
+      touch-action: none;
+    }
+  </style>
+  <link rel="manifest" href="gp.webmanifest">
+</head>
+
+<body>
+  <canvas id="canvas"></canvas>
+  <script>
+    let isInitialized = false;
+
+    let barHeight;
+    let labelFont;
+
+    // Draw loading message
+    const canvas = document.getElementById('canvas');
+
+    let isLandscape, devicePixelRatio;
+    let width, height; // scaled & oriented width and height
+
+    function updateSizes() {
+      isLandscape = window.innerWidth >= window.innerHeight;
+      devicePixelRatio = window.devicePixelRatio || 1;
+      canvas.width = window.innerWidth * devicePixelRatio;
+      canvas.height = window.innerHeight * devicePixelRatio;
+
+      width = isLandscape ? canvas.width / devicePixelRatio : canvas.height / devicePixelRatio;
+      height = isLandscape ? canvas.height / devicePixelRatio : canvas.width / devicePixelRatio;
+
+      barHeight = Math.max(height / 16, 20);
+      labelFont = `${Math.floor(Math.max(barHeight * .75, 12))}px sans-serif`;
+    }
+
+    updateSizes();
+
+    const ctx = canvas.getContext('2d');
+    ctx.font = '48px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('Loading...', canvas.width / 2, canvas.height / 2);
+
+    window.addEventListener('resize', updateSizes);
+
+    // convert to local coordinates
+    function getXY(e) {
+      return { x: isLandscape ? e.clientX : e.clientY, y: isLandscape ? e.clientY : (height - e.clientX) };
+    }
+
+    function getNoteAndVolume(x, y) {
+      let frac_x, frac_y;
+
+      frac_x = x / width;
+      frac_y = 1 - y / height;
+
+      frac_y *= 4; // TODO: numOctaves
+
+      const octave = Math.floor(frac_y);
+      const volume = 2 * Math.min(frac_y - octave, octave + 1 - frac_y);
+      const note = Math.floor(frac_x * 13) + octave * 12;
+
+      return { note, volume };
+    }
+  </script>
+  <script>
+    let audioContext;
+    let grantophoneNode;
+    let delayNode;
+    let gainNode;
+
+    const pointers = {};
+    const isGroupActive = new Array(12).fill(false);
+    isGroupActive[0] = true; // Default to first group active
+
+    async function initAudio() {
+      audioContext = new AudioContext({
+        sampleRate: 48000,
+        latencyHint: 'interactive'
+      });
+      await audioContext.audioWorklet.addModule('grantophone_worklet.js'); // Path to your processor file
+
+      // load wasm
+      const response = await fetch('grantophone.wasm');
+      const wasmArrayBuffer = await response.arrayBuffer();
+
+      grantophoneNode = new AudioWorkletNode(audioContext, 'grantophone-processor', {
+        numberOfInputs: 0,
+        numberOfOutputs: 1,
+        outputChannelCount: [2]
+      });
+
+      grantophoneNode.port.postMessage({ type: 'wasm', wasmArrayBuffer: wasmArrayBuffer }); // Send a message to the processor
+
+      delayNode = new DelayNode(audioContext, { delayTime: 0.25 });
+      gainNode = new GainNode(audioContext, { gain: 0.5 });
+
+      grantophoneNode.connect(audioContext.destination);
+
+      // echo effect
+      // grantophoneNode.connect(delayNode).connect(gainNode).connect(audioContext.destination);
+
+      // gainNode.connect(delayNode);
+
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      canvas.addEventListener('pointerdown', (e) => {
+        // resume audio context on user gesture
+        if (audioContext.state !== 'running') {
+          audioContext.resume();
+        }
+
+        const { x, y } = getXY(e);
+        const { note, volume } = getNoteAndVolume(x, y);
+        pointers[e.pointerId] = { x: x, y: y, note: note, volume: volume };
+        grantophoneNode.port.postMessage({ type: 'pointerdown', id: e.pointerId, x: note, y: volume });
+        e.preventDefault();
+      });
+
+      canvas.addEventListener('pointermove', (e) => {
+        if (pointers[e.pointerId]) {
+          const { x, y } = getXY(e);
+
+          const { note, volume } = getNoteAndVolume(x, y);
+          pointers[e.pointerId].note = note;
+          pointers[e.pointerId].volume = volume;
+          pointers[e.pointerId].x = x;
+          pointers[e.pointerId].y = y;
+          grantophoneNode.port.postMessage({ type: 'pointermove', id: e.pointerId, x: note, y: volume });
+        }
+
+        e.preventDefault();
+      });
+
+      function pointerup(e) {
+        delete pointers[e.pointerId];
+        const { x, y } = getXY(e);
+        const { note, volume } = getNoteAndVolume(e.clientX, e.clientY);
+        grantophoneNode.port.postMessage({ type: 'pointerup', id: e.pointerId, x: note, y: volume });
+        e.preventDefault();
+      }
+
+      ['pointerup', 'pointercancel', 'pointerleave', 'lostpointercapture', 'pointerout'].forEach((event) => {
+        canvas.addEventListener(event, pointerup);
+      });
+
+      // Touch events are already handled by pointer events
+      ['touchstart', 'touchend', 'touchcancel'].forEach((e) => {
+        document.addEventListener(e, (e) => {
+          e.preventDefault();
+        });
+      });
+
+      isInitialized = true;
+    }
+
+
+    function drawKeyboard() {
+      const blackKeys = [1, 3, 6, 8, 10];
+      const keyLabels = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+
+      // Draw black keys
+      ctx.fillStyle = 'black';
+      for (let i = 0; i < 5; i++) {
+        const bx = blackKeys[i] * width / 13;
+
+        ctx.fillRect(bx, 0, width / 13, height);
+      }
+
+      // Draw pressed keys
+      for (const id in pointers) {
+        const { x, y, note, volume } = pointers[id];
+        const octave = Math.floor(note / 12);
+        const key = note % 12;
+        const x1 = Math.floor(x / width * 13) * width / 13;
+        /*
+        frac_y = 1 - y / height;
+
+      frac_y *= 4; // TODO: numOctaves
+
+      const octave = Math.floor(frac_y);
+        */
+
+        const y1 = height - Math.floor((1 - y / height) * 4) * height / 4;
+        ctx.fillStyle = `rgba(0, 128, 255, ${volume})`;
+        ctx.fillRect(x1, y1, width / 13, -height / 4);
+
+      }
+
+
+      ctx.beginPath();
+      ctx.strokeStyle = '#666';
+      // Draw horizontal lines for each octave
+      for (let i = 1; i < 4; i++) {
+        const y = height * (1 - i / 4);
+        ctx.moveTo(0, y);
+        ctx.lineTo(width, y);
+      }
+
+      // Draw vertical lines for each note
+      for (let i = 1; i < 13; i++) {
+        const x = width * i / 13;
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, height);
+      }
+      ctx.stroke();
+
+      // Draw circles for active pointers
+      for (const id in pointers) {
+        const { x, y, w, h, p } = pointers[id];
+        ctx.beginPath();
+        ctx.arc(x, y, 20, 0, 2 * Math.PI);
+        ctx.fillStyle = `rgba(255, 128, 0, .3)`;
+        ctx.fill();
+      }
+
+      // Draw key labels
+      ctx.fillStyle = '#FFF6';
+      ctx.font = labelFont; // TODO: make font size dynamic
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      for (let i = 0; i < 13; i++) {
+        const x = i * width / 13 + width / 26;
+        ctx.fillText(keyLabels[i % 12], x, height - barHeight / 2);
+      }
+
+      // Draw preset selection row at top of screen (1-12) and a edit button
+      ctx.fillStyle = '#666';
+      ctx.fillRect(0, 0, width, barHeight);
+
+      ctx.fillStyle = 'orange';
+      for (let i = 0; i < 12; i++) {
+        if (isGroupActive[i]) {
+          ctx.fillRect(i * width / 13, 0, width / 13, barHeight);
+        }
+      }
+
+      ctx.fillStyle = 'black';
+      for (let i = 0; i < 12; i++) {
+        ctx.fillText(i + 1, i * width / 13 + width / 26, barHeight / 2);
+      }
+
+      // Draw separator lines
+      ctx.beginPath();
+      ctx.strokeStyle = '#999';
+
+
+
+      for (let i = 1; i < 13; i++) {
+        const x = i * width / 13;
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, barHeight);
+      }
+
+      ctx.moveTo(0, barHeight);
+      ctx.lineTo(width, barHeight);
+
+      ctx.stroke();
+
+    }
+
+    function draw() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      if (!isLandscape) {
+        ctx.save();
+        ctx.translate(canvas.width / 2, canvas.height / 2);
+        ctx.rotate(Math.PI / 2); // rotate 90 degrees clockwise
+        ctx.translate(-canvas.height / 2, -canvas.width / 2);
+      }
+
+      if (devicePixelRatio != 1) {
+        ctx.save();
+        ctx.scale(devicePixelRatio, devicePixelRatio);
+      }
+
+      drawKeyboard();
+
+      ctx.fillStyle = 'black';
+
+      // ctx.font = '24px sans-serif';
+      // ctx.textAlign = 'center';
+      // ctx.fillText('Grantophone Classic', width / 2, height / 2 - 100);
+
+      // ctx.font = '16px sans-serif';
+      // ctx.fillText('Double tap to enable sound', width / 2, height / 2 - 50);
+
+      // ctx.font = '12px sans-serif';
+      // ctx.fillText('Touch the screen to play notes', width / 2, height / 2 - 30);
+
+      // ctx.font = '12px sans-serif';
+      // ctx.fillText('Move your finger to change volume', width / 2, height / 2 - 10);
+
+
+
+
+      if (devicePixelRatio != 1) {
+        ctx.restore();
+      }
+
+      if (!isLandscape) {
+        ctx.restore();
+      }
+
+
+
+
+
+      requestAnimationFrame(draw);
+    }
+
+    initAudio();
+    draw();
+  </script>
+
+</body>
+
+</html>
